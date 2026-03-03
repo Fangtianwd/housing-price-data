@@ -570,25 +570,37 @@ func metricPriority(name string) int {
 	}
 }
 
-func writeChartsHTML(path string, records []record, allMetricCols []string) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	chart := buildCombinedChart(records, allMetricCols)
+func writeChartsHTML(path string, records []record, _ []string) error {
+	huanbiChart := buildMetricChart("环比", records)
+	tongbiChart := buildMetricChart("同比", records)
 
 	page := components.NewPage()
 	page.PageTitle = "武汉住宅价格指数"
-	page.AddCharts(chart)
-	return page.Render(file)
+	page.AddCharts(huanbiChart, tongbiChart)
+
+	// Render to buffer so we can inject boundaryGap (not exposed in opts.XAxis).
+	var buf strings.Builder
+	if err := page.Render(&buf); err != nil {
+		return err
+	}
+	html := strings.Replace(buf.String(),
+		`"xAxis":[{"data"`,
+		`"xAxis":[{"boundaryGap":false,"data"`,
+		-1)
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(html)
+	return err
 }
 
-// buildCombinedChart plots all indicators and metrics on a single chart,
-// with series names prefixed by indicator (e.g. "新建-环比", "二手-同比").
-func buildCombinedChart(records []record, allMetricCols []string) *charts.Line {
-	// Collect all periods across all records and sort them.
+// buildMetricChart builds a chart for one metric (e.g. "环比" or "同比"),
+// with one series per indicator (新建 / 二手).
+func buildMetricChart(metric string, records []record) *charts.Line {
+	// Collect all periods across records and sort.
 	periodSet := map[string]struct{}{}
 	for _, r := range records {
 		periodSet[r.PeriodLabel] = struct{}{}
@@ -599,18 +611,31 @@ func buildCombinedChart(records []record, allMetricCols []string) *charts.Line {
 	}
 	sort.Strings(periods)
 
+	yName := "指数（上年同月=100）"
+	if metric == "环比" {
+		yName = "指数（上月=100）"
+	}
+
 	line := charts.NewLine()
 	line.SetGlobalOptions(
-		charts.WithTitleOpts(opts.Title{Title: "武汉住宅销售价格指数（新建 & 二手）"}),
+		charts.WithTitleOpts(opts.Title{Title: "武汉住宅销售价格指数 - " + metric}),
 		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(true)}),
-		charts.WithInitializationOpts(opts.Initialization{Width: "1200px", Height: "600px"}),
-		charts.WithYAxisOpts(opts.YAxis{Scale: opts.Bool(true), Min: "dataMin", Max: "dataMax"}),
+		charts.WithInitializationOpts(opts.Initialization{Width: "1200px", Height: "500px"}),
+		charts.WithXAxisOpts(opts.XAxis{
+			Name:      "月份",
+			AxisLabel: &opts.AxisLabel{Interval: "0", Rotate: 45},
+		}),
+		charts.WithYAxisOpts(opts.YAxis{
+			Name:  yName,
+			Scale: opts.Bool(true),
+			Min:   "dataMin",
+			Max:   "dataMax",
+		}),
 		charts.WithTooltipOpts(opts.Tooltip{Show: opts.Bool(true), Trigger: "axis"}),
 	)
 	line.SetXAxis(periods)
 
 	for _, indicator := range []string{indicatorNew, indicatorUsed} {
-		// Build a period→record lookup for this indicator.
 		byPeriod := map[string]record{}
 		for _, r := range records {
 			if r.Indicator == indicator {
@@ -620,36 +645,20 @@ func buildCombinedChart(records []record, allMetricCols []string) *charts.Line {
 		if len(byPeriod) == 0 {
 			continue
 		}
-
-		// Short label prefix: 新建 / 二手
 		prefix := "新建"
 		if indicator == indicatorUsed {
 			prefix = "二手"
 		}
 
-		for _, metric := range allMetricCols {
-			// Only add series if this metric exists for at least one period.
-			found := false
-			for _, p := range periods {
-				if _, ok := byPeriod[p].Metrics[metric]; ok {
-					found = true
-					break
-				}
+		series := make([]opts.LineData, 0, len(periods))
+		for _, p := range periods {
+			if v, ok := byPeriod[p].Metrics[metric]; ok {
+				series = append(series, opts.LineData{Value: v})
+			} else {
+				series = append(series, opts.LineData{Value: nil})
 			}
-			if !found {
-				continue
-			}
-
-			series := make([]opts.LineData, 0, len(periods))
-			for _, p := range periods {
-				if v, ok := byPeriod[p].Metrics[metric]; ok {
-					series = append(series, opts.LineData{Value: v})
-				} else {
-					series = append(series, opts.LineData{Value: nil})
-				}
-			}
-			line.AddSeries(prefix+"-"+metric, series)
 		}
+		line.AddSeries(prefix, series)
 	}
 
 	return line
