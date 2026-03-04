@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"encoding/xml"
+	"flag"
 	"fmt"
 	"html"
 	"io"
@@ -23,14 +24,20 @@ import (
 )
 
 const (
-	rssURL        = "https://www.stats.gov.cn/sj/zxfb/rss.xml"
-	titleKey      = "70个大中城市商品住宅销售价格变动情况"
-	targetCity    = "武汉"
-	indicatorNew  = "新建商品住宅销售价格指数"
-	indicatorUsed = "二手住宅销售价格指数"
+	rssURL           = "https://www.stats.gov.cn/sj/zxfb/rss.xml"
+	titleKey         = "70个大中城市商品住宅销售价格变动情况"
+	indicatorNew     = "新建商品住宅销售价格指数"
+	indicatorUsed    = "二手住宅销售价格指数"
+	maxFetchAttempts = 3
+	retryBaseDelay   = 400 * time.Millisecond
+	retryMaxDelay    = 2 * time.Second
+	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-var periodRe = regexp.MustCompile(`(\d{4})\s*年\s*(\d{1,2})\s*月(?:份)?`)
+var (
+	periodRe   = regexp.MustCompile(`(\d{4})\s*年\s*(\d{1,2})\s*月(?:份)?`)
+	retrySleep = time.Sleep
+)
 
 type rssFeed struct {
 	Channel struct {
@@ -58,7 +65,23 @@ type record struct {
 	Metrics     map[string]float64
 }
 
+var defaultMetrics = []string{"环比", "同比"}
+
 func main() {
+	city := flag.String("city", "武汉", "目标城市名称")
+	metricsFlag := flag.String("metrics", "", "要提取的指标，逗号分隔（默认: 环比,同比）")
+	flag.Parse()
+
+	var targetMetrics []string
+	if *metricsFlag != "" {
+		targetMetrics = strings.Split(*metricsFlag, ",")
+		for i := range targetMetrics {
+			targetMetrics[i] = strings.TrimSpace(targetMetrics[i])
+		}
+	} else {
+		targetMetrics = defaultMetrics
+	}
+
 	client := &http.Client{Timeout: 20 * time.Second}
 
 	log.Println("fetching RSS feed...")
@@ -76,11 +99,17 @@ func main() {
 			log.Printf("  skip: fetch failed: %v", err)
 			continue
 		}
-		parsed := parseItemPage(page, it)
+		parsed := parseItemPage(page, it, *city, targetMetrics)
 		for _, r := range parsed {
-			log.Printf("  [%s] %s  环比=%.1f  同比=%.1f",
-				r.PeriodLabel, r.Indicator,
-				r.Metrics["环比"], r.Metrics["同比"])
+			var metricVals []string
+			for _, m := range targetMetrics {
+				if v, ok := r.Metrics[m]; ok {
+					metricVals = append(metricVals, fmt.Sprintf("%s=%.1f", m, v))
+				}
+			}
+			if len(metricVals) > 0 {
+				log.Printf("  [%s] %s  %s", r.PeriodLabel, r.Indicator, strings.Join(metricVals, "  "))
+			}
 		}
 		records = append(records, parsed...)
 	}
@@ -92,24 +121,25 @@ func main() {
 		return records[i].Period.Before(records[j].Period)
 	})
 
-	if err := os.MkdirAll("output", 0o755); err != nil {
+	if err := os.MkdirAll("output", 0755); err != nil {
 		log.Fatal(err)
 	}
 
-	csvPath := filepath.Join("output", "wuhan_two_indices_all.csv")
+	metricsSuffix := strings.Join(targetMetrics, "_")
+	csvPath := filepath.Join("output", fmt.Sprintf("%s_%s.csv", *city, metricsSuffix))
 	log.Printf("writing CSV: %s", csvPath)
-	metricOrder, err := writeCSV(csvPath, records)
+	metricOrder, err := writeCSV(csvPath, records, targetMetrics)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	htmlPath := filepath.Join("output", "wuhan_two_indices_charts.html")
+	htmlPath := filepath.Join("output", fmt.Sprintf("%s_%s_charts.html", *city, metricsSuffix))
 	log.Printf("writing HTML: %s", htmlPath)
-	if err := writeChartsHTML(htmlPath, records, metricOrder); err != nil {
+	if err := writeChartsHTML(htmlPath, records, metricOrder, *city, targetMetrics); err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("items scanned: %d\nrecords extracted: %d\nCSV: %s\nHTML: %s\n", len(items), len(records), csvPath, htmlPath)
+	fmt.Printf("city: %s\nmetrics: %v\nitems scanned: %d\nrecords extracted: %d\nCSV: %s\nHTML: %s\n", *city, targetMetrics, len(items), len(records), csvPath, htmlPath)
 }
 
 func fetchMatchedItems(client *http.Client) ([]itemWithPeriod, error) {
@@ -146,10 +176,34 @@ func fetchMatchedItems(client *http.Client) ([]itemWithPeriod, error) {
 }
 
 func fetchBytes(client *http.Client, rawURL string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, strings.TrimSpace(rawURL), nil)
+	url := strings.TrimSpace(rawURL)
+	var lastErr error
+	for attempt := 1; attempt <= maxFetchAttempts; attempt++ {
+		body, err := fetchOnce(client, url)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if attempt == maxFetchAttempts {
+			break
+		}
+		delay := retryDelay(attempt)
+		log.Printf("fetch failed (attempt %d/%d): %v; retrying in %s", attempt, maxFetchAttempts, err, delay)
+		retrySleep(delay)
+	}
+	return nil, lastErr
+}
+
+func fetchOnce(client *http.Client, url string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Referer", "https://www.stats.gov.cn/")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -159,6 +213,17 @@ func fetchBytes(client *http.Client, rawURL string) ([]byte, error) {
 		return nil, fmt.Errorf("http status %d", resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := retryBaseDelay * time.Duration(1<<(attempt-1))
+	if delay > retryMaxDelay {
+		return retryMaxDelay
+	}
+	return delay
 }
 
 func parsePeriod(title, pubDate string) (time.Time, string) {
@@ -187,7 +252,7 @@ func parsePubDate(s string) time.Time {
 	return time.Time{}
 }
 
-func parseItemPage(content []byte, it itemWithPeriod) []record {
+func parseItemPage(content []byte, it itemWithPeriod, targetCity string, targetMetrics []string) []record {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(content)))
 	if err != nil {
 		return nil
@@ -196,6 +261,9 @@ func parseItemPage(content []byte, it itemWithPeriod) []record {
 	tables := doc.Find(".detail-text-content .txt-content .trs_editor_view table")
 	if tables.Length() == 0 {
 		tables = doc.Find(".trs_editor_view table")
+	}
+	if tables.Length() == 0 {
+		tables = doc.Find("table")
 	}
 
 	var out []record
@@ -210,18 +278,18 @@ func parseItemPage(content []byte, it itemWithPeriod) []record {
 			return
 		}
 
-			table.Find("tr").Each(func(_ int, tr *goquery.Selection) {
+		table.Find("tr").Each(func(_ int, tr *goquery.Selection) {
 			row := extractRow(tr)
 			if len(row) == 0 || looksLikeHeader(row) {
 				return
 			}
 
-				segHeader, segRow := pickCitySegment(row, header, targetCity)
-				if len(segRow) == 0 || len(segHeader) == 0 {
+			segHeader, segRow := pickCitySegment(row, header, targetCity)
+			if len(segRow) == 0 || len(segHeader) == 0 {
 				return
 			}
 
-				city, metrics := extractCityAndMetrics(segHeader, segRow)
+			city, metrics := extractCityAndMetrics(segHeader, segRow, targetCity, targetMetrics)
 			if !containsCity(city, targetCity) || len(metrics) == 0 {
 				return
 			}
@@ -409,13 +477,18 @@ func segmentContainsCity(seg []string, city string) bool {
 	return false
 }
 
-func extractCityAndMetrics(header, row []string) (string, map[string]float64) {
+func extractCityAndMetrics(header, row []string, targetCity string, targetMetrics []string) (string, map[string]float64) {
 	n := len(header)
 	if len(row) < n {
 		n = len(row)
 	}
 	if n == 0 {
 		return "", nil
+	}
+
+	metricSet := make(map[string]bool, len(targetMetrics))
+	for _, m := range targetMetrics {
+		metricSet[m] = true
 	}
 
 	city := ""
@@ -438,7 +511,7 @@ func extractCityAndMetrics(header, row []string) (string, map[string]float64) {
 		if strings.Contains(k, "分类") {
 			continue
 		}
-		if !strings.Contains(k, "环比") && !strings.Contains(k, "同比") {
+		if !containsAnyMetric(k, targetMetrics) {
 			continue
 		}
 		if f, ok := parseNumber(v); ok {
@@ -455,6 +528,15 @@ func extractCityAndMetrics(header, row []string) (string, map[string]float64) {
 		}
 	}
 	return city, metrics
+}
+
+func containsAnyMetric(s string, metrics []string) bool {
+	for _, m := range metrics {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseNumber(s string) (float64, bool) {
@@ -502,14 +584,14 @@ func dedupeByIndicatorPeriod(in []record) []record {
 	return out
 }
 
-func writeCSV(path string, records []record) ([]string, error) {
+func writeCSV(path string, records []record, targetMetrics []string) ([]string, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	metricCols := collectMetricColumns(records)
+	metricCols := collectMetricColumns(records, targetMetrics)
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
@@ -534,7 +616,7 @@ func writeCSV(path string, records []record) ([]string, error) {
 	return metricCols, w.Error()
 }
 
-func collectMetricColumns(records []record) []string {
+func collectMetricColumns(records []record, targetMetrics []string) []string {
 	set := map[string]struct{}{}
 	for _, r := range records {
 		for k := range r.Metrics {
@@ -546,8 +628,8 @@ func collectMetricColumns(records []record) []string {
 		cols = append(cols, k)
 	}
 	sort.Slice(cols, func(i, j int) bool {
-		pi := metricPriority(cols[i])
-		pj := metricPriority(cols[j])
+		pi := metricPriority(cols[i], targetMetrics)
+		pj := metricPriority(cols[j], targetMetrics)
 		if pi != pj {
 			return pi < pj
 		}
@@ -556,27 +638,22 @@ func collectMetricColumns(records []record) []string {
 	return cols
 }
 
-func metricPriority(name string) int {
+func metricPriority(name string, targetMetrics []string) int {
 	s := normalizeText(name)
-	switch {
-	case strings.Contains(s, "环比"):
-		return 0
-	case strings.Contains(s, "同比"):
-		return 1
-	case strings.Contains(s, "定基"):
-		return 2
-	default:
-		return 3
+	for i, m := range targetMetrics {
+		if strings.Contains(s, m) {
+			return i
+		}
 	}
+	return len(targetMetrics)
 }
 
-func writeChartsHTML(path string, records []record, _ []string) error {
-	huanbiChart := buildMetricChart("环比", records)
-	tongbiChart := buildMetricChart("同比", records)
-
+func writeChartsHTML(path string, records []record, _ []string, city string, targetMetrics []string) error {
 	page := components.NewPage()
-	page.PageTitle = "武汉住宅价格指数"
-	page.AddCharts(huanbiChart, tongbiChart)
+	page.PageTitle = city + "住宅价格指数"
+	for _, metric := range targetMetrics {
+		page.AddCharts(buildMetricChart(metric, records, city))
+	}
 
 	// Render to buffer so we can inject boundaryGap (not exposed in opts.XAxis).
 	var buf strings.Builder
@@ -599,7 +676,7 @@ func writeChartsHTML(path string, records []record, _ []string) error {
 
 // buildMetricChart builds a chart for one metric (e.g. "环比" or "同比"),
 // with one series per indicator (新建 / 二手).
-func buildMetricChart(metric string, records []record) *charts.Line {
+func buildMetricChart(metric string, records []record, city string) *charts.Line {
 	// Collect all periods across records and sort.
 	periodSet := map[string]struct{}{}
 	for _, r := range records {
@@ -618,7 +695,7 @@ func buildMetricChart(metric string, records []record) *charts.Line {
 
 	line := charts.NewLine()
 	line.SetGlobalOptions(
-		charts.WithTitleOpts(opts.Title{Title: "武汉住宅销售价格指数 - " + metric}),
+		charts.WithTitleOpts(opts.Title{Title: city + "住宅销售价格指数 - " + metric}),
 		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(true)}),
 		charts.WithInitializationOpts(opts.Initialization{Width: "1200px", Height: "500px"}),
 		charts.WithXAxisOpts(opts.XAxis{

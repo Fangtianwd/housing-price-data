@@ -1,19 +1,28 @@
 # housing-price-data
 
-使用 Go 抓取国家统计局 RSS 中“70个大中城市商品住宅销售价格变动情况”各期数据，提取武汉市两个指标：
-- 新建商品住宅销售价格指数
-- 二手住宅销售价格指数
-
-说明：仅保留上述两个指标，排除“分类指数”相关表。
+使用 Go 抓取国家统计局 RSS 中"70个大中城市商品住宅销售价格变动情况"各期数据，提取指定城市指定指标。
 
 ## 运行
 
 ```bash
 go mod tidy
-go run .
+go run .                                    # 默认：武汉，环比+同比
+go run . -city 北京                          # 抓取北京
+go run . -city 上海 -metrics 环比,同比,定基    # 抓取上海的三种指标
 ```
+
+## 参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-city` | 目标城市名称 | 武汉 |
+| `-metrics` | 要提取的指标，逗号分隔 | 环比,同比 |
 
 ## 输出
 
-- output/wuhan_two_indices_all.csv
-- output/wuhan_two_indices_charts.html
+- output/{城市}_{指标1}_{指标2}.csv
+- output/{城市}_{指标1}_{指标2}_charts.html
+
+示例：
+- `武汉_环比_同比.csv`
+- `北京_环比_同比_定基.csv`

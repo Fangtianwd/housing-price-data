@@ -1,11 +1,45 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// ── fetchBytes ────────────────────────────────────────────────────────────────
+
+func TestFetchBytesRetriesWithHeaders(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		assert.Equal(t, defaultUserAgent, r.Header.Get("User-Agent"))
+		if attempts < 2 {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer server.Close()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	origSleep := retrySleep
+	defer func() { retrySleep = origSleep }()
+	var slept []time.Duration
+	retrySleep = func(d time.Duration) { slept = append(slept, d) }
+
+	body, err := fetchBytes(client, server.URL)
+	require.NoError(t, err)
+	assert.Equal(t, "ok", string(body))
+	assert.GreaterOrEqual(t, attempts, 2)
+	require.NotEmpty(t, slept)
+	assert.Equal(t, retryDelay(1), slept[0])
+}
 
 // ── normalizeText ──────────────────────────────────────────────────────────────
 
@@ -193,17 +227,17 @@ func TestExtractCityAndMetrics(t *testing.T) {
 	t.Run("normal row", func(t *testing.T) {
 		header := []string{"城市", "环比", "同比", "定基"}
 		row := []string{"武汉", "101.2", "99.8", "110.5"}
-		city, metrics := extractCityAndMetrics(header, row)
+		city, metrics := extractCityAndMetrics(header, row, "武汉", []string{"环比", "同比"})
 		assert.Equal(t, "武汉", city)
 		assert.InDelta(t, 101.2, metrics["环比"], 1e-9)
 		assert.InDelta(t, 99.8, metrics["同比"], 1e-9)
-		assert.NotContains(t, metrics, "定基") // 非环比/同比列被过滤
+		assert.NotContains(t, metrics, "定基") // 非目标指标被过滤
 	})
 
 	t.Run("分类 column is skipped", func(t *testing.T) {
 		header := []string{"城市", "分类", "环比"}
 		row := []string{"武汉", "新建", "101.2"}
-		city, metrics := extractCityAndMetrics(header, row)
+		city, metrics := extractCityAndMetrics(header, row, "武汉", []string{"环比", "同比"})
 		assert.Equal(t, "武汉", city)
 		assert.NotContains(t, metrics, "分类")
 	})
@@ -211,16 +245,26 @@ func TestExtractCityAndMetrics(t *testing.T) {
 	t.Run("row shorter than header — truncate gracefully", func(t *testing.T) {
 		header := []string{"城市", "环比", "同比"}
 		row := []string{"武汉", "101.2"}
-		city, metrics := extractCityAndMetrics(header, row)
+		city, metrics := extractCityAndMetrics(header, row, "武汉", []string{"环比", "同比"})
 		assert.Equal(t, "武汉", city)
 		assert.InDelta(t, 101.2, metrics["环比"], 1e-9)
 		assert.NotContains(t, metrics, "同比")
 	})
 
 	t.Run("empty inputs", func(t *testing.T) {
-		city, metrics := extractCityAndMetrics([]string{}, []string{})
+		city, metrics := extractCityAndMetrics([]string{}, []string{}, "武汉", []string{"环比", "同比"})
 		assert.Empty(t, city)
 		assert.Nil(t, metrics)
+	})
+
+	t.Run("custom metrics", func(t *testing.T) {
+		header := []string{"城市", "环比", "同比", "定基"}
+		row := []string{"武汉", "101.2", "99.8", "110.5"}
+		city, metrics := extractCityAndMetrics(header, row, "武汉", []string{"定基"})
+		assert.Equal(t, "武汉", city)
+		assert.NotContains(t, metrics, "环比")
+		assert.NotContains(t, metrics, "同比")
+		assert.InDelta(t, 110.5, metrics["定基"], 1e-9)
 	})
 }
 
@@ -250,10 +294,11 @@ func TestDedupeByIndicatorPeriodEmpty(t *testing.T) {
 // ── metricPriority ────────────────────────────────────────────────────────────
 
 func TestMetricPriority(t *testing.T) {
-	assert.Equal(t, 0, metricPriority("环比涨跌幅"))
-	assert.Equal(t, 1, metricPriority("同比涨跌幅"))
-	assert.Equal(t, 2, metricPriority("定基价格指数"))
-	assert.Equal(t, 3, metricPriority("其他指标"))
+	targetMetrics := []string{"环比", "同比"}
+	assert.Equal(t, 0, metricPriority("环比涨跌幅", targetMetrics))
+	assert.Equal(t, 1, metricPriority("同比涨跌幅", targetMetrics))
+	assert.Equal(t, 2, metricPriority("定基价格指数", targetMetrics))
+	assert.Equal(t, 2, metricPriority("其他指标", targetMetrics))
 }
 
 // ── collectMetricColumns ──────────────────────────────────────────────────────
@@ -263,10 +308,10 @@ func TestCollectMetricColumns(t *testing.T) {
 		{Metrics: map[string]float64{"同比": 1, "环比": 2}},
 		{Metrics: map[string]float64{"定基": 3, "环比": 2}},
 	}
-	cols := collectMetricColumns(records)
+	cols := collectMetricColumns(records, []string{"环比", "同比"})
 	assert.Equal(t, []string{"环比", "同比", "定基"}, cols)
 }
 
 func TestCollectMetricColumnsEmpty(t *testing.T) {
-	assert.Empty(t, collectMetricColumns(nil))
+	assert.Empty(t, collectMetricColumns(nil, []string{"环比", "同比"}))
 }

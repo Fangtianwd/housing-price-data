@@ -46,7 +46,9 @@ func TestFetchAndParseLatestArticle(t *testing.T) {
 	page, err := fetchBytes(client, latest.Item.Link)
 	require.NoError(t, err, "文章页面应能正常获取")
 
-	records := parseItemPage(page, latest)
+	targetCity := "武汉"
+	targetMetrics := []string{"环比", "同比"}
+	records := parseItemPage(page, latest, targetCity, targetMetrics)
 	require.NotEmpty(t, records, "应从文章中解析出至少一条记录")
 
 	for _, r := range records {
@@ -88,6 +90,8 @@ func TestBothIndicatorsPresent(t *testing.T) {
 
 	hasNew := false
 	hasUsed := false
+	targetCity := "武汉"
+	targetMetrics := []string{"环比", "同比"}
 
 	for _, it := range items {
 		page, err := fetchBytes(client, it.Item.Link)
@@ -95,7 +99,7 @@ func TestBothIndicatorsPresent(t *testing.T) {
 			t.Logf("跳过（获取失败）：%s — %v", it.Item.Link, err)
 			continue
 		}
-		for _, r := range parseItemPage(page, it) {
+		for _, r := range parseItemPage(page, it, targetCity, targetMetrics) {
 			switch r.Indicator {
 			case indicatorNew:
 				hasNew = true
